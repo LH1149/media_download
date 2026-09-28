@@ -1,0 +1,10 @@
+# 二进制大文件（GitHub 不适合托管，exe 通过 Release 发布）
+bin/
+dist/
+build/
+backup/*/bin/
+backup/*/dist/
+
+# Python
+__pycache__/
+*.pyc
