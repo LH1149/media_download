@@ -57,12 +57,27 @@ pip install yt-dlp pyinstaller imageio-ffmpeg
 
 产物为 `dist\MediaDownloader.exe`（约 52 MB，已内置 FFmpeg，可独立分发）。
 
+## 发布新版本
+
+仓库提供 `release.ps1`，一条命令完成「打包 → 提交 → 打 tag → 推送 → 创建 GitHub Release → 上传 exe」：
+
+```powershell
+# 完整流程（会重新打包 exe）
+powershell -ExecutionPolicy Bypass -File .\release.ps1 -Version v1.1 -Notes "修复 xx 问题；新增 xx 功能"
+
+# exe 已打包好，仅发布
+powershell -ExecutionPolicy Bypass -File .\release.ps1 -Version v1.1 -Notes "..." -SkipBuild
+```
+
+要求 git push 凭据已缓存（本机首次推送时登录过即可），令牌自动从 Git 凭据管理器读取，无需手动提供。
+
 ## 项目结构
 
 ```
 .
 ├── media_downloader.py    # 全部源码：tkinter GUI + yt-dlp 下载逻辑
 ├── build.bat              # 一键打包脚本
+├── release.ps1            # 一键发布脚本（tag + GitHub Release + 上传 exe）
 ├── MediaDownloader.spec   # PyInstaller 配置
 ├── bin/ffmpeg.exe         # 打包用 FFmpeg（不入库，构建时自备）
 ├── dist/                  # 打包产物（不入库，见 Releases）
