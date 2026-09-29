@@ -12,8 +12,9 @@
 
     前置条件：
       - 已安装 git 且能推送（凭据已缓存，即 git push 可成功）
-      - 已安装 Python 依赖：yt-dlp pyinstaller imageio-ffmpeg
+      - 已安装 Python 依赖：yt-dlp pyinstaller imageio-ffmpeg pillow
       - 远程仓库 origin 已配置
+      - 图标源图 assets\icon.jpg 存在（换图标只需替换它）
 
 .PARAMETER Version
     版本号（同时作为 git tag），例如 v1.1
@@ -88,8 +89,17 @@ if (-not $SkipBuild) {
         if ($LASTEXITCODE -ne 0) { throw "ffmpeg 准备失败，请先 pip install imageio-ffmpeg" }
     }
 
+    # 由 assets\icon.jpg 生成多尺寸 icon.ico（换图标只需替换该 jpg）
+    & $py make_icon.py
+    if ($LASTEXITCODE -ne 0) { throw "图标生成失败，请确认 assets\icon.jpg 存在" }
+
     & $py -m PyInstaller --noconfirm --onefile --windowed --name MediaDownloader `
-        --add-binary "bin\ffmpeg.exe;." --collect-all yt_dlp media_downloader.py
+        --icon "assets\icon.ico" `
+        --add-binary "bin\ffmpeg.exe;." `
+        --add-data "assets\icon.ico;assets" `
+        --add-data "assets\skin.default.jpg;assets" `
+        --hidden-import PIL._tkinter_finder `
+        --collect-all yt_dlp media_downloader.py
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller 打包失败" }
     Remove-Item -Recurse -Force "build" -ErrorAction SilentlyContinue
 } else {

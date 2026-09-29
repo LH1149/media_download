@@ -8,3 +8,9 @@ backup/*/dist/
 # Python
 __pycache__/
 *.pyc
+
+# 图标 ico 为生成物（由 assets/icon.jpg 经 make_icon.py 生成）
+assets/*.ico
+
+# 用户自定义皮肤（运行时生成于 exe 同目录）
+/skins/

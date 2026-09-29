@@ -8,13 +8,18 @@
 
 import os
 import sys
+import json
 import time
 import queue
+import shutil
 import threading
 import traceback
+import ctypes
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox
+
+from PIL import Image, ImageTk, ImageDraw
 
 try:
     import yt_dlp
@@ -36,6 +41,174 @@ def app_dir():
 def bundle_dir():
     """PyInstaller onefile 解包目录（运行期临时目录）。"""
     return getattr(sys, "_MEIPASS", app_dir())
+
+
+def find_icon_path():
+    """查找打包资源 / assets 目录中的 icon.ico，找不到返回 None。"""
+    candidates = [
+        os.path.join(bundle_dir(), "assets", "icon.ico"),
+        os.path.join(bundle_dir(), "icon.ico"),
+        os.path.join(app_dir(), "assets", "icon.ico"),
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+# ---------------------------------------------------------------- 皮肤管理
+
+def skins_dir():
+    """用户皮肤目录（位于 exe 同目录，便于跨版本保留）。"""
+    return os.path.join(app_dir(), "skins")
+
+
+def skin_config_path():
+    return os.path.join(skins_dir(), "skin.json")
+
+
+def _read_config():
+    try:
+        with open(skin_config_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_config(data):
+    os.makedirs(skins_dir(), exist_ok=True)
+    with open(skin_config_path(), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def default_skin_path():
+    """内置默认背景皮肤。"""
+    for p in (os.path.join(bundle_dir(), "assets", "skin.default.jpg"),
+              os.path.join(app_dir(), "assets", "skin.default.jpg")):
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def default_panel_path():
+    """内置默认右侧面板图。"""
+    for p in (os.path.join(bundle_dir(), "assets", "panel.default.jpg"),
+              os.path.join(app_dir(), "assets", "panel.default.jpg")):
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def current_skin_path():
+    """当前背景图：用户自定义优先，否则默认。"""
+    custom = _read_config().get("skin_file")
+    if custom:
+        p = os.path.join(skins_dir(), os.path.basename(custom))
+        if os.path.isfile(p):
+            return p
+    return default_skin_path()
+
+
+def current_panel_path():
+    """当前右侧面板图：用户自定义优先，否则默认。"""
+    custom = _read_config().get("panel_file")
+    if custom:
+        p = os.path.join(skins_dir(), os.path.basename(custom))
+        if os.path.isfile(p):
+            return p
+    return default_panel_path()
+
+
+def _copy_to_skins(src_path, prefix):
+    os.makedirs(skins_dir(), exist_ok=True)
+    ext = os.path.splitext(src_path)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+        ext = ".jpg"
+    dst = os.path.join(skins_dir(), prefix + ext)
+    shutil.copyfile(src_path, dst)
+    return os.path.basename(dst)
+
+
+def import_skin(src_path):
+    """更换背景皮肤图片。"""
+    name = _copy_to_skins(src_path, "skin_custom")
+    data = _read_config()
+    data["skin_file"] = name
+    _write_config(data)
+    return os.path.join(skins_dir(), name)
+
+
+def import_panel(src_path):
+    """更换右侧面板图片。"""
+    name = _copy_to_skins(src_path, "panel_custom")
+    data = _read_config()
+    data["panel_file"] = name
+    _write_config(data)
+    return os.path.join(skins_dir(), name)
+
+
+def reset_skin():
+    """恢复默认背景皮肤。"""
+    data = _read_config()
+    data.pop("skin_file", None)
+    _write_config(data)
+    if os.path.isdir(skins_dir()):
+        for f in os.listdir(skins_dir()):
+            if f.lower().startswith("skin_custom"):
+                try:
+                    os.remove(os.path.join(skins_dir(), f))
+                except OSError:
+                    pass
+
+
+def reset_panel():
+    """恢复默认右侧面板。"""
+    data = _read_config()
+    data.pop("panel_file", None)
+    _write_config(data)
+    if os.path.isdir(skins_dir()):
+        for f in os.listdir(skins_dir()):
+            if f.lower().startswith("panel_custom"):
+                try:
+                    os.remove(os.path.join(skins_dir(), f))
+                except OSError:
+                    pass
+
+
+def cover_resize(img, w, h):
+    """等比放大并居中裁剪，铺满 w×h（类似 CSS object-fit: cover）。"""
+    src_w, src_h = img.size
+    scale = max(w / src_w, h / src_h)
+    new_w, new_h = max(1, round(src_w * scale)), max(1, round(src_h * scale))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - w) // 2
+    top = (new_h - h) // 2
+    return img.crop((left, top, left + w, top + h))
+
+
+def cover_image(path, w, h, mode="RGB"):
+    """读取图片并按 cover 方式缩放到 w×h，失败返回 None。"""
+    try:
+        img = Image.open(path).convert(mode)
+    except Exception:
+        return None
+    return cover_resize(img, w, h)
+
+
+def circle_thumb(path, size):
+    """生成正方形居中裁剪后的圆形缩略图，失败返回 None。"""
+    try:
+        img = Image.open(path).convert("RGBA")
+    except Exception:
+        return None
+    side = min(img.size)
+    img = img.crop(((img.width - side) // 2, (img.height - side) // 2,
+                    (img.width + side) // 2, (img.height + side) // 2))
+    img = img.resize((size, size), Image.LANCZOS)
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+    img.putalpha(mask)
+    return img
 
 
 def find_ffmpeg_dir():
@@ -237,6 +410,17 @@ class DownloadJob(threading.Thread):
         self._log(f"模式：{mode_text}    画质：{self.quality_label}")
         self._log(f"保存到：{self.out_dir}")
 
+        # 预取标题（不下载），用于右侧面板显示
+        try:
+            with yt_dlp.YoutubeDL(dict(opts, quiet=True, no_warnings=True,
+                                       skip_download=True)) as ydl:
+                info0 = ydl.extract_info(self.url, download=False)
+            title = (info0 or {}).get("title") or self.url
+            self.q.put(("info", title,
+                        f"清晰度：{self.quality_label}　音频：{self.audio_label}"))
+        except Exception:
+            pass
+
         # 外层重试：yt-dlp 内部 10 次重试用尽后，等待一段时间再整体重试，
         # 应对 B站 CDN 持续 503 / 断连的情况。每轮从零开始下载。
         MAX_OUTER_RETRIES = 3
@@ -313,114 +497,747 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("网页音视频下载器")
-        self.geometry("760x560")
-        self.minsize(680, 520)
+        self.geometry("1080x720+80+60")
+        self.minsize(920, 620)
+
+        # 窗口标题栏 / 任务栏图标
+        icon = find_icon_path()
+        if icon:
+            try:
+                self.iconbitmap(default=icon)
+            except Exception:
+                pass
 
         self.msg_q = queue.Queue()
         self.job = None
         self.ffmpeg_dir = find_ffmpeg_dir()
 
+        # 无边框圆角窗口相关状态
+        self._win_mode = None       # "move" / "resize" / None
+        self._drag_start = None
+        self._maximized = False
+        self._saved_geom = None
+
         self._build_ui()
         self._on_mode_change()
         self.after(120, self._poll_queue)
+        self.after(60, self._enable_frameless)
 
         if yt_dlp is None:
             messagebox.showerror("启动错误", "缺少 yt-dlp 组件，请重新获取本程序。")
             self.after(100, self.destroy)
 
-    # ---- 界面 ----
+    LEFT_W = 180
+    RIGHT_W = 330
+    AVATAR_SIZE = 84
+    TITLE_H = 48          # 自定义标题栏高度
+    WIN_RADIUS = 24       # 窗口外圆角半径
+    TRANS_KEY = "#ff00fe"  # 透明色键（窗口四角用）
+
+    # iOS 玻璃配色
+    GLASS_FILL = (255, 255, 255, 148)     # 白色半透明玻璃（透出背景）
+    GLASS_EDGE = (255, 255, 255, 120)     # 顶部高光边
+    TEXT_DARK = "#1d2230"
+    TEXT_GREY = "#5c6478"
+    FIELD_BG = "#ffffff"
+    FIELD_BD = "#d3d8e2"
+    IOS_BLUE = "#0a84ff"
+    IOS_PINK = "#ff375f"
+
+    # ---- 主题 ----
+    def _setup_theme(self):
+        s = ttk.Style(self)
+        try:
+            s.theme_use("clam")
+        except tk.TclError:
+            pass
+        fg = self.TEXT_DARK
+        field = self.FIELD_BG
+        border = self.FIELD_BD
+        # ttk 控件背景与玻璃面板一致（白），视觉上融入
+        glass_hex = "#eef1f7"
+        s.configure(".", background=glass_hex, foreground=fg,
+                    font=("Microsoft YaHei UI", 10))
+        s.configure("TFrame", background=glass_hex)
+        s.configure("TLabel", background=glass_hex, foreground=fg)
+        s.configure("TEntry", fieldbackground=field, foreground=fg,
+                    insertcolor=fg, bordercolor=border, lightcolor=border,
+                    darkcolor=border, padding=5)
+        s.configure("TCombobox", fieldbackground=field, foreground=fg,
+                    background=field, bordercolor=border, lightcolor=border,
+                    darkcolor=border, arrowcolor="#5c6478", padding=3)
+        s.map("TCombobox",
+              fieldbackground=[("readonly", field)],
+              foreground=[("readonly", fg)],
+              bordercolor=[("focus", self.IOS_BLUE)])
+        # 下拉列表配色
+        self.option_add("*TCombobox*Listbox.background", field)
+        self.option_add("*TCombobox*Listbox.foreground", fg)
+        self.option_add("*TCombobox*Listbox.selectBackground", self.IOS_BLUE)
+        self.option_add("*TCombobox*Listbox.selectForeground", "white")
+
+    # ---- 界面构建 ----
     def _build_ui(self):
-        pad = {"padx": 8, "pady": 4}
-        root = ttk.Frame(self)
-        root.pack(fill="both", expand=True, padx=10, pady=10)
+        self._setup_theme()
+        self._bg_photo = None
+        self._avatar_photo = None
+        self._bg_after = None
+        self._prog_rect = None          # 进度条几何 (x,y,w,h)
+        self._seg_geom = None           # 分段控件几何
+        self._chk_rect = None           # 勾选框几何
+        self._progress_frac = 0.0
+        self._btn_imgs = {}             # 自绘按钮图片引用（防 GC）
 
-        # URL
-        row = ttk.Frame(root)
-        row.pack(fill="x", **pad)
-        ttk.Label(row, text="网页地址：", width=10).pack(side="left")
+        self.configure(bg=self.TRANS_KEY)
+        self.bg_canvas = tk.Canvas(self, highlightthickness=0,
+                                   bg=self.TRANS_KEY, bd=0)
+        self.bg_canvas.pack(fill="both", expand=True)
+        self.bg_canvas.bind("<Configure>", self._on_bg_configure)
+        # 自定义标题栏：拖动移动 / 右下角缩放 / 双击最大化
+        self.bg_canvas.bind("<ButtonPress-1>", self._win_press)
+        self.bg_canvas.bind("<B1-Motion>", self._win_drag)
+        self.bg_canvas.bind("<ButtonRelease-1>", self._win_release)
+        self.bg_canvas.bind("<Double-Button-1>", self._win_double)
+        self.bg_canvas.bind("<Motion>", self._win_hover)
+
+        # ---------- 中心控件（仅保留原生输入控件，按钮全部自绘） ----------
         self.url_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.url_var).pack(
-            side="left", fill="x", expand=True)
+        self.url_entry = ttk.Entry(self.bg_canvas, textvariable=self.url_var,
+                                   font=("Microsoft YaHei UI", 10))
 
-        # 模式
-        row = ttk.LabelFrame(root, text="下载内容")
-        row.pack(fill="x", **pad)
         self.mode_var = tk.StringVar(value="merge")
-        for text, val in (("音视频合并（推荐）", "merge"),
-                          ("仅音频", "audio"),
-                          ("仅视频（无声画面）", "video")):
-            ttk.Radiobutton(row, text=text, value=val,
-                            variable=self.mode_var,
-                            command=self._on_mode_change).pack(
-                side="left", padx=10, pady=6)
 
-        # 选项
-        row = ttk.Frame(root)
-        row.pack(fill="x", **pad)
-        ttk.Label(row, text="画质上限：").pack(side="left")
         self.quality_var = tk.StringVar(value="最佳画质")
         self.quality_combo = ttk.Combobox(
-            row, textvariable=self.quality_var, state="readonly",
-            values=list(QUALITY_MAP.keys()), width=14)
-        self.quality_combo.pack(side="left", padx=(0, 16))
-
-        ttk.Label(row, text="音频格式：").pack(side="left")
+            self.bg_canvas, textvariable=self.quality_var, state="readonly",
+            values=list(QUALITY_MAP.keys()), width=12)
         self.audio_var = tk.StringVar(value="MP3")
         self.audio_combo = ttk.Combobox(
-            row, textvariable=self.audio_var, state="readonly",
-            values=list(AUDIO_MAP.keys()), width=12)
-        self.audio_combo.pack(side="left", padx=(0, 16))
+            self.bg_canvas, textvariable=self.audio_var, state="readonly",
+            values=list(AUDIO_MAP.keys()), width=10)
+        # 强制初始值写入，避免部分主题下首帧空白
+        self.quality_combo.set("最佳画质")
+        self.audio_combo.set("MP3")
 
         self.single_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="只下载当前视频（不下载整个播放列表）",
-                        variable=self.single_var).pack(side="left")
 
-        # 输出目录
-        row = ttk.Frame(root)
-        row.pack(fill="x", **pad)
-        ttk.Label(row, text="保存位置：", width=10).pack(side="left")
         self.dir_var = tk.StringVar(value=default_download_dir())
-        ttk.Entry(row, textvariable=self.dir_var).pack(
-            side="left", fill="x", expand=True)
-        ttk.Button(row, text="浏览…", command=self._choose_dir).pack(
-            side="left", padx=(6, 0))
-        ttk.Button(row, text="打开目录", command=self._open_dir).pack(
-            side="left", padx=(6, 0))
+        self.dir_entry = ttk.Entry(self.bg_canvas, textvariable=self.dir_var)
 
-        # 操作按钮
-        row = ttk.Frame(root)
-        row.pack(fill="x", **pad)
-        self.start_btn = ttk.Button(row, text="开始下载", command=self._start)
-        self.start_btn.pack(side="left")
-        self.cancel_btn = ttk.Button(row, text="取消", command=self._cancel,
-                                     state="disabled")
-        self.cancel_btn.pack(side="left", padx=8)
-        ff_status = "ffmpeg 已就绪" if self.ffmpeg_dir else "ffmpeg 缺失（合并/转码不可用）"
-        ttk.Label(row, text=ff_status,
-                  foreground="green" if self.ffmpeg_dir else "#b06a00").pack(
-            side="right")
+        # ---------- 右侧面板状态 ----------
+        self.title_var = tk.StringVar(value="等待解析视频信息…")
+        self.fmt_var = tk.StringVar(value="清晰度：—　音频格式：—")
+        self.action_var = tk.StringVar(value="就绪")
+        self.status_var = self.action_var
 
-        # 进度
-        row = ttk.Frame(root)
-        row.pack(fill="x", **pad)
-        self.progress = ttk.Progressbar(row, mode="determinate", maximum=100)
-        self.progress.pack(side="left", fill="x", expand=True)
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(row, textvariable=self.status_var, width=16,
-                  anchor="e").pack(side="left", padx=(8, 0))
+        self.after(10, self._layout)
 
-        # 日志
-        self.log_box = scrolledtext.ScrolledText(root, height=12, wrap="word",
-                                                 state="disabled", font=("Consolas", 9))
-        self.log_box.pack(fill="both", expand=True, **pad)
+    # ---- 背景渲染 ----
+    def _render_background(self, W, H, lx, ly, lw, lh, rx, ry, rw, rh):
+        skin = current_skin_path()
+        img = cover_image(skin, W, H) if skin else None
+        if img is None:
+            img = Image.new("RGB", (W, H), "#23283a")
+        img = img.convert("RGBA")
+
+        # 三块统一的 iOS 白色玻璃面板（无独立右侧面板图）
+        overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        radius = 26
+        panels = [(lx, ly, lx + lw, ly + lh),
+                  (rx, ry, rx + rw, ry + rh)]
+        cx0 = lx + lw + 16
+        cx1 = rx - 16
+        if cx1 > cx0 + 2:
+            panels.append((cx0, ly, cx1, ly + lh))
+        for box in panels:
+            # 玻璃主体
+            od.rounded_rectangle(box, radius=radius, fill=self.GLASS_FILL)
+            # 顶部高光阴线
+            od.arc([box[0], box[1], box[0] + 2 * radius, box[1] + 2 * radius],
+                   start=180, end=270, fill=self.GLASS_EDGE, width=2)
+            od.line([box[0] + radius, box[1], box[2] - radius, box[1]],
+                    fill=self.GLASS_EDGE, width=2)
+            od.arc([box[2] - 2 * radius, box[1], box[2], box[1] + 2 * radius],
+                   start=270, end=360, fill=self.GLASS_EDGE, width=2)
+        img = Image.alpha_composite(img, overlay)
+
+        # 整窗圆角遮罩：四角透明（露出 transparentcolor 色键）
+        wr = min(self.WIN_RADIUS, W // 2, H // 2)
+        mask = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, W - 1, H - 1], radius=wr, fill=255)
+        img.putalpha(mask)
+
+        self._bg_photo = ImageTk.PhotoImage(img)
+        self.bg_canvas.delete("bg")
+        self.bg_canvas.create_image(0, 0, anchor="nw", image=self._bg_photo, tags="bg")
+        self.bg_canvas.tag_lower("bg")
+
+    def _set_text(self, tag, x, y, text, **kw):
+        """在 canvas 上放置/更新一个文字项（透明背景）。"""
+        self.bg_canvas.delete(tag)
+        kw.setdefault("anchor", "w")
+        kw.setdefault("fill", self.TEXT_DARK)
+        kw.setdefault("font", ("Microsoft YaHei UI", 10))
+        self.bg_canvas.create_text(x, y, text=text, tags=tag, **kw)
+
+    def _update_text(self, tag, text):
+        """仅更新已有文字项内容，不重渲染背景。"""
+        items = self.bg_canvas.find_withtag(tag)
+        if items:
+            self.bg_canvas.itemconfigure(items[0], text=text[:80])
+
+    # ---- 自绘圆角控件 ----
+    def _rounded_img(self, w, h, radius, fill, outline=None, ow=1):
+        """生成一张圆角矩形 RGBA 图片。fill/outline 为 (r,g,b,a)。"""
+        scale = 2  # 超采样抗锯齿
+        im = Image.new("RGBA", (w * scale, h * scale), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        box = [ow * scale, ow * scale,
+               w * scale - ow * scale - 1, h * scale - ow * scale - 1]
+        d.rounded_rectangle(box, radius=radius * scale, fill=fill,
+                            outline=outline, width=ow * scale)
+        return im.resize((w, h), Image.LANCZOS)
+
+    def _draw_button(self, tag, x, y, w, h, text, kind="glass",
+                     command=None, enabled=True):
+        """在主画布上绘制 iOS 风格圆角按钮。kind: blue/glass/gray/ghost/dark。"""
+        self.bg_canvas.delete(tag)
+        if not enabled:
+            fill = (209, 214, 224, 200)
+            tcolor = "#9aa2b2"
+            outline = None
+        elif kind == "dark":
+            # 标题栏深色半透明胶囊；关闭按钮悬停变红
+            if tag == "b_close":
+                fill = (255, 55, 95, 235)
+            else:
+                fill = (18, 20, 28, 150)
+            tcolor = "#ffffff"
+            outline = (255, 255, 255, 70)
+        elif kind == "blue":
+            fill = (10, 132, 255, 255)
+            tcolor = "#ffffff"
+            outline = None
+        elif kind == "gray":
+            fill = (228, 231, 237, 235)
+            tcolor = self.TEXT_DARK
+            outline = None
+        elif kind == "ghost":
+            fill = (255, 255, 255, 60)
+            tcolor = self.TEXT_DARK
+            outline = (255, 255, 255, 160)
+        else:  # glass：浅色玻璃按钮
+            fill = (255, 255, 255, 150)
+            tcolor = self.TEXT_DARK
+            outline = (255, 255, 255, 200)
+        im = self._rounded_img(w, h, h // 2, fill, outline)
+        photo = ImageTk.PhotoImage(im)
+        self._btn_imgs[tag] = photo
+        cid = self.bg_canvas.create_image(x, y, anchor="nw", image=photo,
+                                          tags=(tag, "ctrl"))
+        tid = self.bg_canvas.create_text(
+            x + w // 2, y + h // 2, text=text, tags=(tag, "ctrl"),
+            font=("Microsoft YaHei UI", 10, "bold" if kind == "blue" else "normal"),
+            fill=tcolor)
+        if command and enabled:
+            for i in (cid, tid):
+                self.bg_canvas.tag_bind(i, "<Button-1>",
+                                        lambda _e, c=command: c())
+                self.bg_canvas.tag_bind(i, "<Enter>",
+                                        lambda _e, t=tag: self.bg_canvas.configure(cursor="hand2"))
+                self.bg_canvas.tag_bind(i, "<Leave>",
+                                        lambda _e: self.bg_canvas.configure(cursor=""))
+
+    def _draw_segmented(self, tag, x, y, w, h, options, variable, command=None):
+        """iOS 分段控件。options: [(显示文字, 值), ...]，画在主画布上。"""
+        self.bg_canvas.delete(tag)
+        self._seg_geom = (x, y, w, h, options, variable, command)
+        scale = 2
+        im = Image.new("RGBA", (w * scale, h * scale), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        # 容器
+        d.rounded_rectangle([0, 0, w * scale - 1, h * scale - 1],
+                            radius=h * scale // 2, fill=(120, 128, 145, 55))
+        # 选中滑块
+        n = len(options)
+        sw = w / n
+        sel = variable.get()
+        idx = next((i for i, (_, v) in enumerate(options) if v == sel), 0)
+        pad = 3 * scale
+        sx0 = idx * sw * scale + pad
+        sx1 = (idx + 1) * sw * scale - pad
+        d.rounded_rectangle([sx0, pad, sx1, h * scale - pad - 1],
+                            radius=(h - 3) * scale // 2,
+                            fill=(255, 255, 255, 255))
+        photo = ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
+        self._btn_imgs[tag] = photo
+        iid = self.bg_canvas.create_image(x, y, anchor="nw", image=photo,
+                                          tags=(tag, "ctrl"))
+        text_ids = []
+        for i, (label, val) in enumerate(options):
+            active = (val == sel)
+            tid = self.bg_canvas.create_text(
+                x + int((i + 0.5) * sw), y + h // 2, text=label,
+                tags=(tag, "ctrl"),
+                font=("Microsoft YaHei UI", 9, "bold" if active else "normal"),
+                fill=self.TEXT_DARK if active else self.TEXT_GREY)
+            text_ids.append(tid)
+        # 整块区域（图片 + 每个文字）统一按点击 X 坐标判定分段，
+        # 不能只绑定文字笔画——否则点中滑块空白处不会切换
+        handler = lambda e: self._segment_click(
+            x, w, options, variable, command, e)
+        self.bg_canvas.tag_bind(iid, "<Button-1>", handler)
+        for tid in text_ids:
+            self.bg_canvas.tag_bind(tid, "<Button-1>", handler)
+
+    def _select_segment(self, value, variable, command):
+        variable.set(value)
+        if command:
+            command()
+
+    def _segment_click(self, x, w, options, variable, command, event):
+        n = len(options)
+        sw = w / n
+        idx = min(n - 1, max(0, int((event.x - x) / sw)))
+        self._select_segment(options[idx][1], variable, command)
+
+    def _layout(self):
+        W = max(1, self.winfo_width())
+        H = max(1, self.winfo_height())
+        if W < 200 or H < 200:
+            self.after(100, self._layout)
+            return
+
+        M = 16
+        top = self.TITLE_H + 4          # 面板起始 Y（让出标题栏）
+        lw = self.LEFT_W
+        rw = self.RIGHT_W
+        lx, ly = M, top
+        lh = H - top - M
+        rx = W - rw - M
+        ry = top
+        rh = H - top - M
+        cx = lx + lw + 16
+        cw = rx - cx - 16
+
+        self._render_background(W, H, lx, ly, lw, lh, rx, ry, rw, rh)
+        self._place_titlebar(W)
+        self._place_left(lx, ly, lw, lh)
+        self._place_center(cx, ly, cw, lh)
+        self._place_right(rx, ry, rw, rh)
+
+    # ---- 自定义标题栏 ----
+    def _place_titlebar(self, W):
+        self.bg_canvas.delete("titlebar")
+        # 小图标
+        icon = find_icon_path()
+        if icon:
+            img = circle_thumb(icon, 26)
+            if img is not None:
+                self._tb_icon = ImageTk.PhotoImage(img)
+                self.bg_canvas.create_image(
+                    18, 11, anchor="nw", image=self._tb_icon,
+                    tags="titlebar")
+        # 标题文字（阴影 + 白字，保证在任意背景上可读）
+        self.bg_canvas.create_text(
+            54, 24, text="网页音视频下载器", anchor="w",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            fill="#000000", tags="titlebar")
+        self.bg_canvas.create_text(
+            53, 23, text="网页音视频下载器", anchor="w",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            fill="#ffffff", tags="titlebar")
+        # 最小化 / 关闭按钮（深色半透明胶囊）
+        self._draw_button("b_min", W - 104, 10, 44, 28, "—",
+                          "dark", self._win_minimize)
+        self._draw_button("b_close", W - 52, 10, 40, 28, "✕",
+                          "dark", self._win_close)
+
+    def _enable_frameless(self):
+        """去掉原生边框，开启透明色键，并让窗口出现在任务栏。"""
+        try:
+            self.overrideredirect(True)
+            self.attributes("-transparentcolor", self.TRANS_KEY)
+        except tk.TclError:
+            return
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            cur = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ctypes.windll.user32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE, cur | WS_EX_APPWINDOW)
+            # 恢复无边框窗口的阴影
+            class _MARGINS(ctypes.Structure):
+                _fields_ = [("cxLeftWidth", ctypes.c_int),
+                            ("cxRightWidth", ctypes.c_int),
+                            ("cyTopHeight", ctypes.c_int),
+                            ("cyBottomHeight", ctypes.c_int)]
+            m = _MARGINS(1, 1, 1, 1)
+            try:
+                ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(
+                    hwnd, ctypes.byref(m))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _win_press(self, e):
+        W, H = self.winfo_width(), self.winfo_height()
+        # 右下角缩放热区
+        if e.x >= W - 14 and e.y >= H - 14:
+            self._win_mode = "resize"
+            self._drag_start = (e.x_root, e.y_root, W, H)
+            return
+        # 标题栏拖动区（避开右上角按钮）
+        if e.y <= self.TITLE_H and e.x < W - 116 and not self._maximized:
+            self._win_mode = "move"
+            self._drag_start = (e.x_root - self.winfo_x(),
+                                e.y_root - self.winfo_y())
+
+    def _win_drag(self, e):
+        if not self._win_mode or not self._drag_start:
+            return
+        if self._win_mode == "move":
+            dx, dy = self._drag_start
+            self.geometry(f"+{e.x_root - dx}+{e.y_root - dy}")
+        elif self._win_mode == "resize":
+            sx, sy, sw, sh = self._drag_start
+            nw = max(920, sw + e.x_root - sx)
+            nh = max(620, sh + e.y_root - sy)
+            self.geometry(f"{nw}x{nh}")
+
+    def _win_release(self, _e):
+        self._win_mode = None
+        self._drag_start = None
+
+    def _win_hover(self, e):
+        W, H = self.winfo_width(), self.winfo_height()
+        if e.x >= W - 14 and e.y >= H - 14:
+            self.bg_canvas.configure(cursor="size_nw_se")
+        else:
+            self.bg_canvas.configure(cursor="")
+
+    def _win_double(self, e):
+        if e.y <= self.TITLE_H and e.x < self.winfo_width() - 116:
+            self._toggle_maximize()
+
+    def _toggle_maximize(self):
+        if not self._maximized:
+            self._saved_geom = (self.winfo_x(), self.winfo_y(),
+                                self.winfo_width(), self.winfo_height())
+
+            class _RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+            r = _RECT()
+            ctypes.windll.user32.SystemParametersInfoW(0x0030, 0,
+                                                       ctypes.byref(r), 0)
+            self.geometry(
+                f"{r.right - r.left}x{r.bottom - r.top}+{r.left}+{r.top}")
+            self._maximized = True
+        else:
+            x, y, w, h = self._saved_geom
+            self.geometry(f"{w}x{h}+{x}+{y}")
+            self._maximized = False
+
+    def _win_minimize(self):
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            ctypes.windll.user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+        except Exception:
+            pass
+
+    def _win_close(self):
+        self.destroy()
+
+    def _place_left(self, x, y, w, h):
+        bw = w - 32
+        # 头像
+        ax = x + (w - self.AVATAR_SIZE) // 2
+        ay = y + 22
+        self._draw_avatar(ax, ay)
+        by = ay + self.AVATAR_SIZE + 22
+        gap_b = 12
+        self._draw_button("b_avatar", x + 16, by, bw, 38, "替换头像",
+                          "glass", self._choose_avatar)
+        self._draw_button("b_skin", x + 16, by + (38 + gap_b), bw, 38,
+                          "更换背景皮肤", "glass", self._choose_skin)
+        self._draw_button("b_reset", x + 16, by + 2 * (38 + gap_b), bw, 38,
+                          "恢复默认", "glass", self._reset_all)
+        self._draw_button("b_open", x + 16, by + 3 * (38 + gap_b), bw, 36,
+                          "打开皮肤文件夹", "ghost", self._open_skins_dir)
+
+    def _draw_avatar(self, x, y):
+        self.bg_canvas.delete("avatar")
+        src = self._avatar_path()
+        img = circle_thumb(src, self.AVATAR_SIZE) if src else None
+        if img is None:
+            return
+        self._avatar_photo = ImageTk.PhotoImage(img)
+        self.bg_canvas.create_image(x, y, anchor="nw", image=self._avatar_photo,
+                                    tags="avatar")
+
+    def _place_center(self, x, y, w, h):
+        pad = 20
+        # 标题
+        self._set_text("c_title", x + pad, y + 26, "网页音视频下载器",
+                       font=("Microsoft YaHei UI", 16, "bold"),
+                       fill=self.TEXT_DARK)
+        self._set_text("c_sub", x + pad, y + 52,
+                       "支持 YouTube / B站 / 抖音等上千个站点",
+                       font=("Microsoft YaHei UI", 9), fill=self.TEXT_GREY)
+
+        # URL 行（输入框占满）
+        uy = y + 84
+        url_w = max(120, w - 2 * pad)
+        self.url_entry.place(x=x + pad, y=uy, width=url_w, height=38)
+
+        # 下载模式 —— iOS 分段控件
+        my = uy + 62
+        self._set_text("c_mode", x + pad, my - 18, "下载模式",
+                       font=("Microsoft YaHei UI", 9), fill=self.TEXT_GREY)
+        seg_w = min(360, w - 2 * pad)
+        self._draw_segmented(
+            "seg_mode", x + pad, my, seg_w, 36,
+            [("音视频合并", "merge"), ("仅音频", "audio"), ("仅视频", "video")],
+            self.mode_var, command=self._on_mode_change)
+
+        # 画质 / 音频
+        qy = my + 56
+        self._set_text("c_q", x + pad, qy + 15, "画质上限",
+                       font=("Microsoft YaHei UI", 9), fill=self.TEXT_GREY)
+        self.quality_combo.place(x=x + pad + 80, y=qy, width=130, height=34)
+        self._set_text("c_a", x + pad + 228, qy + 15, "音频格式",
+                       font=("Microsoft YaHei UI", 9), fill=self.TEXT_GREY)
+        self.audio_combo.place(x=x + pad + 302, y=qy, width=120, height=34)
+
+        # 只下载当前视频（独立一行，iOS 粉色勾选）
+        cy = qy + 48
+        self._chk_rect = (x + pad, cy, w - 2 * pad)
+        self._draw_single_check(x + pad, cy, w - 2 * pad)
+
+        # 保存位置（窄窗时按钮自动换到下一行）
+        dy = cy + 40
+        self._set_text("c_save", x + pad, dy + 16, "保存位置",
+                       font=("Microsoft YaHei UI", 9), fill=self.TEXT_GREY)
+        ex = x + pad + 80
+        avail = w - 2 * pad - 80
+        need = 72 + 88 + 20  # 两个按钮 + 间距
+        if avail - need - 16 >= 150:
+            # 一行：输入框 + 浏览 + 打开目录
+            dir_w = avail - need - 16
+            self.dir_entry.place(x=ex, y=dy, width=dir_w, height=34)
+            self._draw_button("b_browse", ex + dir_w + 8, dy - 1,
+                              72, 36, "浏览…", "gray", self._choose_dir)
+            self._draw_button("b_open_dir", ex + dir_w + 88, dy - 1,
+                              88, 36, "打开目录", "gray", self._open_dir)
+            by2 = dy + 56
+        else:
+            # 两行：输入框占满，按钮右对齐到下一行
+            self.dir_entry.place(x=ex, y=dy, width=avail, height=34)
+            row2 = dy + 44
+            self._draw_button("b_browse", x + w - pad - 160, row2 - 1,
+                              72, 36, "浏览…", "gray", self._choose_dir)
+            self._draw_button("b_open_dir", x + w - pad - 88, row2 - 1,
+                              88, 36, "打开目录", "gray", self._open_dir)
+            by2 = row2 + 48
+
+        # 操作按钮 + ffmpeg 状态
+        running = bool(self.job and self.job.is_alive())
+        self._draw_button("b_start", x + pad, by2, 120, 40, "开始下载",
+                          "blue", self._start, enabled=not running)
+        self._draw_button("b_cancel", x + pad + 136, by2, 90, 40, "取消",
+                          "gray", self._cancel, enabled=running)
+        ff = "ffmpeg 已就绪" if self.ffmpeg_dir else "ffmpeg 缺失（合并/转码不可用）"
+        self._set_text("c_ff", x + pad + 244, by2 + 20, ff, anchor="w",
+                       fill="#1d9e52" if self.ffmpeg_dir else "#c77700",
+                       font=("Microsoft YaHei UI", 9))
+
+    def _place_right(self, x, y, w, h):
+        pad = 20
+        # 标题
+        self._set_text("r_label", x + pad, y + 24, "下载信息",
+                       font=("Microsoft YaHei UI", 14, "bold"),
+                       fill=self.TEXT_DARK)
+        # 视频标题（最多两行）
+        self._set_text("r_title", x + pad, y + 62, self.title_var.get(),
+                       font=("Microsoft YaHei UI", 12, "bold"),
+                       fill=self.TEXT_DARK, width=w - 2 * pad)
+        # 格式信息
+        self._set_text("r_fmt", x + pad, y + 110, self.fmt_var.get(),
+                       font=("Microsoft YaHei UI", 9), fill=self.TEXT_GREY)
+        # 进度标题行
+        py = y + 172
+        pw = w - 2 * pad
+        ph = 14
+        self._set_text("r_proglabel", x + pad, py - 24, "下载进度", anchor="w",
+                       font=("Microsoft YaHei UI", 10, "bold"),
+                       fill=self.TEXT_DARK)
+        pct = int(self._progress_frac * 100)
+        self._set_text("r_pct", x + w - pad, py - 24, f"{pct}%", anchor="e",
+                       font=("Microsoft YaHei UI", 13, "bold"),
+                       fill=self.TEXT_DARK)
+        # 进度条（直接画在主画布上，胶囊形）
+        self._prog_rect = (x + pad, py, pw, ph)
+        self._render_progress()
+        # 当前动作
+        self._set_text("r_action", x + pad, py + 34, self.action_var.get(),
+                       font=("Microsoft YaHei UI", 9), fill=self.TEXT_GREY,
+                       width=w - 2 * pad)
+
+    def _render_progress(self):
+        """在主画布上绘制胶囊渐变进度条（无独立黑框 Canvas）。"""
+        self.bg_canvas.delete("prog")
+        if not self._prog_rect:
+            return
+        x, y, w, h = self._prog_rect
+        if w <= 1:
+            return
+        frac = max(0.0, min(1.0, self._progress_frac))
+        scale = 2
+        im = Image.new("RGBA", (w * scale, h * scale), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        # 轨道：浅色半透明胶囊（融入玻璃，无黑框）
+        d.rounded_rectangle(
+            [0, 0, w * scale - 1, h * scale - 1],
+            radius=h * scale // 2, fill=(120, 128, 145, 45))
+        if frac > 0:
+            fw = max(h * scale, int(w * scale * frac))
+            grad = Image.new("RGBA", (fw, h * scale), (0, 0, 0, 0))
+            gp = grad.load()
+            for px in range(fw):
+                t = px / max(1, fw - 1)
+                r = int(10 + (255 - 10) * t)     # iOS 蓝 -> 粉
+                g = int(132 + (55 - 132) * t)
+                b = int(255 + (95 - 255) * t)
+                for py2 in range(h * scale):
+                    gp[px, py2] = (r, g, b, 255)
+            mask = Image.new("L", (fw, h * scale), 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                [0, 0, fw - 1, h * scale - 1],
+                radius=h * scale // 2, fill=255)
+            im.paste(grad, (0, 0), mask)
+        self._prog_photo = ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
+        self.bg_canvas.create_image(x, y, anchor="nw", image=self._prog_photo,
+                                    tags="prog")
+        self.bg_canvas.tag_raise("prog")
+
+    def _set_progress(self, frac):
+        """更新进度值并重绘。"""
+        self._progress_frac = max(0.0, min(1.0, frac))
+        self.after_idle(self._render_progress)
+
+    def _draw_single_check(self, x, y, max_w):
+        """iOS 风格勾选框：未选圆角空心框，选中粉色填充 + 白色 √。"""
+        self.bg_canvas.delete("chk")
+        box = 20
+        gap = 10
+        checked = self.single_var.get()
+        scale = 2
+        im = Image.new("RGBA", (box * scale, box * scale), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        r = 6 * scale
+        if checked:
+            d.rounded_rectangle(
+                [0, 0, box * scale - 1, box * scale - 1],
+                radius=r, fill=self.IOS_PINK)
+            # 白色 √
+            d.line([(4 * scale, 10 * scale), (8 * scale, 14 * scale),
+                    (15 * scale, 5 * scale)],
+                   fill="white", width=2 * scale, joint="curve")
+        else:
+            d.rounded_rectangle(
+                [0, 0, box * scale - 1, box * scale - 1],
+                radius=r, outline=(110, 118, 138, 220), width=2 * scale)
+        self._chk_photo = ImageTk.PhotoImage(im.resize((box, box), Image.LANCZOS))
+        iid = self.bg_canvas.create_image(x, y, anchor="nw",
+                                          image=self._chk_photo, tags="chk")
+        tid = self.bg_canvas.create_text(
+            x + box + gap, y + box // 2,
+            text="只下载当前视频（不下载整个列表）", anchor="w",
+            font=("Microsoft YaHei UI", 9), fill=self.TEXT_DARK,
+            width=max(60, max_w - box - gap), tags="chk")
+        for i in (iid, tid):
+            self.bg_canvas.tag_bind(i, "<Button-1>", self._toggle_single)
+
+    def _toggle_single(self, _event=None):
+        self.single_var.set(not self.single_var.get())
+        if self._chk_rect:
+            x, y, mw = self._chk_rect
+            self._draw_single_check(x, y, mw)
+
+    def _on_bg_configure(self, _event):
+        if self._bg_after:
+            self.after_cancel(self._bg_after)
+        self._bg_after = self.after(120, self._layout)
+
+    # ---- 头像 ----
+    def _avatar_path(self):
+        custom = os.path.join(skins_dir(), "avatar.png")
+        if os.path.isfile(custom):
+            return custom
+        return find_icon_path() or current_skin_path()
+
+    def _choose_avatar(self):
+        path = filedialog.askopenfilename(
+            title="选择头像图片",
+            filetypes=[("图片文件", "*.jpg *.jpeg *.png *.webp *.bmp"),
+                       ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            img = Image.open(path).convert("RGBA")
+            img = cover_resize(img, 256, 256)
+            os.makedirs(skins_dir(), exist_ok=True)
+            img.save(os.path.join(skins_dir(), "avatar.png"), "PNG")
+        except Exception as e:
+            messagebox.showerror("更换头像失败", f"无法使用该图片：\n{e}")
+            return
+        self._layout()
+
+    # ---- 皮肤 / 面板 ----
+    def _choose_skin(self):
+        path = self._ask_image("选择背景皮肤图片")
+        if not path:
+            return
+        try:
+            import_skin(path)
+        except Exception as e:
+            messagebox.showerror("更换皮肤失败", f"无法使用该图片：\n{e}")
+            return
+        self._layout()
+
+    def _reset_all(self):
+        reset_skin()
+        reset_panel()
+        av = os.path.join(skins_dir(), "avatar.png")
+        if os.path.isfile(av):
+            try:
+                os.remove(av)
+            except OSError:
+                pass
+        self._layout()
+
+    def _ask_image(self, title):
+        return filedialog.askopenfilename(
+            title=title,
+            filetypes=[("图片文件", "*.jpg *.jpeg *.png *.webp *.bmp"),
+                       ("所有文件", "*.*")])
+
+    def _open_skins_dir(self):
+        d = skins_dir()
+        os.makedirs(d, exist_ok=True)
+        os.startfile(d)  # noqa: S606  (Windows)
 
     def _on_mode_change(self):
-        mode = self.mode_var.get()
-        audio_mode = (mode == "audio")
-        self.quality_combo.configure(
-            state="disabled" if audio_mode else "readonly")
-        self.audio_combo.configure(
-            state="readonly" if audio_mode else "disabled")
+        # 两个下拉框始终可用，已选值永不丢失；只重绘分段滑块
+        if self._seg_geom:
+            x, y, w, h, options, variable, command = self._seg_geom
+            self._draw_segmented("seg_mode", x, y, w, h, options,
+                                 variable, command=command)
 
     def _choose_dir(self):
         d = filedialog.askDirectory(initialdir=self.dir_var.get()) \
@@ -449,8 +1266,7 @@ class App(tk.Tk):
         if self.job and self.job.is_alive():
             return
 
-        self.progress.configure(mode="determinate", value=0)
-        self._clear_log()
+        self._set_progress(0.0)
         self._set_running(True)
         self.status_var.set("准备中…")
 
@@ -470,11 +1286,11 @@ class App(tk.Tk):
         if self.job and self.job.is_alive():
             self.job.cancel()
             self.status_var.set("正在取消…")
-            self.cancel_btn.configure(state="disabled")
+            self._update_text("r_action", "正在取消…")
 
     def _set_running(self, running):
-        self.start_btn.configure(state="disabled" if running else "normal")
-        self.cancel_btn.configure(state="normal" if running else "disabled")
+        # 重绘开始/取消按钮的可用状态
+        self._layout()
 
     # ---- 消息轮询 ----
     def _poll_queue(self):
@@ -483,44 +1299,48 @@ class App(tk.Tk):
                 msg = self.msg_q.get_nowait()
                 kind = msg[0]
                 if kind == "log":
-                    self._append_log(msg[1])
+                    pass  # 日志不再显示在界面上
+                elif kind == "info":
+                    self.title_var.set(msg[1])
+                    self.fmt_var.set(msg[2])
+                    self._update_text("r_title", msg[1])
+                    self._update_text("r_fmt", msg[2])
                 elif kind == "progress":
                     frac, text = msg[1], msg[2]
                     if frac < 0:
-                        self.progress.configure(mode="indeterminate")
-                        self.progress.start(15)
+                        # 不确定进度：显示一个小条在动
+                        self._set_progress(0.0)
                     else:
-                        self.progress.stop()
-                        self.progress.configure(mode="determinate",
-                                                value=frac * 100)
+                        self._set_progress(frac)
                     self.status_var.set(text[:60])
+                    self._update_text("r_action", text)
+                    self._update_text("r_pct",
+                                      f"{int(max(0, frac) * 100)}%")
                 elif kind == "done":
                     ok, text = msg[1], msg[2]
-                    self.progress.stop()
-                    self.progress.configure(mode="determinate",
-                                            value=100 if ok else self.progress["value"])
+                    if ok:
+                        self._set_progress(1.0)
+                        self._update_text("r_pct", "100%")
                     self.status_var.set(text)
+                    self._update_text("r_action", text)
                     self._set_running(False)
                     if ok:
-                        self._append_log("===== 全部完成 =====")
                         messagebox.showinfo("完成", "下载完成！")
         except queue.Empty:
             pass
         self.after(120, self._poll_queue)
 
-    def _append_log(self, text):
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", text + "\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
-
-    def _clear_log(self):
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", "end")
-        self.log_box.configure(state="disabled")
 
 
 def main():
+    # Windows 任务栏分组 ID：设置后任务栏才会显示自定义图标而非默认 Python 图标
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "LH1149.MediaDownloader.App")
+        except Exception:
+            pass
     App().mainloop()
 
 
