@@ -2,6 +2,16 @@
 
 基于 [yt-dlp](https://github.com/yt-dlp/yt-dlp) + FFmpeg 的 Windows 图形界面工具，可从网页 URL 下载音视频资源，支持上千个网站（YouTube、B站、抖音、X/Twitter 等）。FFmpeg 已内置，**单文件 exe 开箱即用，无需安装 Python 或任何依赖**。
 
+## 界面预览
+
+**动态背景（视频皮肤）模式** — 控件采用半透明 ghost 样式，不遮挡动态背景：
+
+<video src="docs/video.mp4" controls muted loop width="100%" poster="docs/pic.png"></video>
+
+**静态背景（图片皮肤）模式**：
+
+![静态背景效果](docs/pic.png)
+
 ## 功能特性
 
 - **三种下载模式**
