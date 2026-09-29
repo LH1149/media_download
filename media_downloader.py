@@ -19,7 +19,7 @@ import ctypes
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageChops
 
 try:
     import yt_dlp
@@ -122,7 +122,8 @@ def current_panel_path():
 def _copy_to_skins(src_path, prefix):
     os.makedirs(skins_dir(), exist_ok=True)
     ext = os.path.splitext(src_path)[1].lower()
-    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".bmp",
+                   ".mp4", ".webm", ".mkv", ".mov", ".avi", ".gif"):
         ext = ".jpg"
     dst = os.path.join(skins_dir(), prefix + ext)
     shutil.copyfile(src_path, dst)
@@ -209,6 +210,100 @@ def circle_thumb(path, size):
     ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
     img.putalpha(mask)
     return img
+
+
+# ---------- 视频背景支持 ----------
+
+VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".gif")
+
+
+def is_video_path(path):
+    return path and os.path.splitext(path)[1].lower() in VIDEO_EXTS
+
+
+class VideoBackgroundPlayer:
+    """用 ffmpeg 子进程从视频文件读取 RGB 帧，线程安全队列供主线程消费。"""
+
+    def __init__(self, video_path, width, height, fps=20, ffmpeg_exe="ffmpeg"):
+        self.path = video_path
+        self.w = max(2, width)
+        self.h = max(2, height)
+        self.fps = fps
+        self.ffmpeg = ffmpeg_exe
+        self._proc = None
+        self._thread = None
+        self._queue = queue.Queue(maxsize=3)
+        self._stop = threading.Event()
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._proc:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            self._proc = None
+        # 清空队列
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def get_frame(self):
+        """非阻塞取一帧 PIL.Image，无可用帧返回 None。"""
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _read_loop(self):
+        import subprocess
+        vf = (f"scale={self.w}:{self.h}:force_original_aspect_ratio=increase,"
+              f"crop={self.w}:{self.h}")
+        while not self._stop.is_set():
+            try:
+                self._proc = subprocess.Popen(
+                    [self.ffmpeg, "-i", self.path,
+                     "-vf", vf, "-pix_fmt", "rgba",
+                     "-r", str(self.fps), "-f", "rawvideo", "-"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=0x08000000)  # CREATE_NO_WINDOW
+            except Exception:
+                return
+            frame_size = self.w * self.h * 4
+            while not self._stop.is_set():
+                raw = self._proc.stdout.read(frame_size)
+                if len(raw) < frame_size:
+                    break  # 视频结束，外层循环重新启动实现循环播放
+                if self._stop.is_set():
+                    break
+                img = Image.frombytes("RGBA", (self.w, self.h), raw)
+                try:
+                    self._queue.put(img, timeout=0.5)
+                except queue.Full:
+                    # 主线程消费慢，丢弃旧帧保持最新
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._queue.put(img, timeout=0.5)
+                    except queue.Full:
+                        pass
+            if self._proc:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+                self._proc = None
 
 
 def find_ffmpeg_dir():
@@ -517,6 +612,15 @@ class App(tk.Tk):
         self._drag_start = None
         self._maximized = False
         self._saved_geom = None
+        # 视频背景播放器
+        self._video_player = None
+        self._video_after = None
+        self._glass_overlay = None     # 预渲染的玻璃覆盖层 RGBA
+        self._glass_photo = None       # 玻璃覆盖层 PhotoImage（视频模式用）
+        self._glass_rgb = None         # 玻璃 RGB 通道（视频帧合成用）
+        self._glass_alpha = None       # 玻璃 alpha 通道（视频帧合成用）
+        self._corner_mask = None       # 圆角遮罩（视频帧合成用）
+        self._video_mode = False       # 是否处于视频背景模式
 
         self._build_ui()
         self._on_mode_change()
@@ -635,12 +739,31 @@ class App(tk.Tk):
     # ---- 背景渲染 ----
     def _render_background(self, W, H, lx, ly, lw, lh, rx, ry, rw, rh):
         skin = current_skin_path()
-        img = cover_image(skin, W, H) if skin else None
-        if img is None:
-            img = Image.new("RGB", (W, H), "#23283a")
-        img = img.convert("RGBA")
+        self._video_mode = skin is not None and is_video_path(skin)
+        # 预渲染玻璃覆盖层（含圆角遮罩），供视频帧和静态图共用
+        self._glass_overlay = self._render_glass_overlay(
+            W, H, lx, ly, lw, lh, rx, ry, rw, rh)
 
-        # 三块统一的 iOS 白色玻璃面板（无独立右侧面板图）
+        if skin and is_video_path(skin):
+            # 视频背景：停掉旧播放器，启动新的
+            self._stop_video_bg()
+            self._start_video_bg(skin, W, H)
+        else:
+            # 静态图片背景：停掉视频，一次性渲染
+            self._stop_video_bg()
+            img = cover_image(skin, W, H) if skin else None
+            if img is None:
+                img = Image.new("RGB", (W, H), "#23283a")
+            img = img.convert("RGBA")
+            img = Image.alpha_composite(img, self._glass_overlay)
+            self._bg_photo = ImageTk.PhotoImage(img)
+            self.bg_canvas.delete("bg")
+            self.bg_canvas.create_image(
+                0, 0, anchor="nw", image=self._bg_photo, tags="bg")
+            self.bg_canvas.tag_lower("bg")
+
+    def _render_glass_overlay(self, W, H, lx, ly, lw, lh, rx, ry, rw, rh):
+        """生成含玻璃面板 + 圆角遮罩的 RGBA 覆盖层。"""
         overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         od = ImageDraw.Draw(overlay)
         radius = 26
@@ -651,28 +774,69 @@ class App(tk.Tk):
         if cx1 > cx0 + 2:
             panels.append((cx0, ly, cx1, ly + lh))
         for box in panels:
-            # 玻璃主体
             od.rounded_rectangle(box, radius=radius, fill=self.GLASS_FILL)
-            # 顶部高光阴线
             od.arc([box[0], box[1], box[0] + 2 * radius, box[1] + 2 * radius],
                    start=180, end=270, fill=self.GLASS_EDGE, width=2)
             od.line([box[0] + radius, box[1], box[2] - radius, box[1]],
                     fill=self.GLASS_EDGE, width=2)
             od.arc([box[2] - 2 * radius, box[1], box[2], box[1] + 2 * radius],
                    start=270, end=360, fill=self.GLASS_EDGE, width=2)
-        img = Image.alpha_composite(img, overlay)
-
-        # 整窗圆角遮罩：四角透明（露出 transparentcolor 色键）
+        # 圆角遮罩：窗口四角透明
         wr = min(self.WIN_RADIUS, W // 2, H // 2)
         mask = Image.new("L", (W, H), 0)
         ImageDraw.Draw(mask).rounded_rectangle(
             [0, 0, W - 1, H - 1], radius=wr, fill=255)
-        img.putalpha(mask)
+        # 将遮罩与玻璃 alpha 相乘（四角透明 + 玻璃面板半透明）
+        overlay.putalpha(ImageChops.multiply(overlay.split()[3], mask))
+        # 预计算供视频帧合成使用的通道
+        self._glass_rgb = overlay.convert("RGB")
+        self._glass_alpha = overlay.split()[3]
+        self._corner_mask = mask
+        return overlay
 
-        self._bg_photo = ImageTk.PhotoImage(img)
-        self.bg_canvas.delete("bg")
-        self.bg_canvas.create_image(0, 0, anchor="nw", image=self._bg_photo, tags="bg")
-        self.bg_canvas.tag_lower("bg")
+    # ---- 视频背景 ----
+    def _start_video_bg(self, path, W, H):
+        ffmpeg_exe = "ffmpeg"
+        if self.ffmpeg_dir:
+            ffmpeg_exe = os.path.join(self.ffmpeg_dir, "ffmpeg.exe")
+        self._video_player = VideoBackgroundPlayer(path, W, H, fps=30,
+                                                   ffmpeg_exe=ffmpeg_exe)
+        self._video_player.start()
+        self._update_video_frame()
+
+    def _stop_video_bg(self):
+        if self._video_after:
+            self.after_cancel(self._video_after)
+            self._video_after = None
+        if self._video_player:
+            self._video_player.stop()
+            self._video_player = None
+        self._bg_photo = None
+        self._glass_photo = None
+        self.bg_canvas.delete("bg_video")
+        self.bg_canvas.delete("bg_overlay")
+
+    def _update_video_frame(self):
+        """从视频播放器取帧，仅加圆角 alpha 后更新画布底层。
+        玻璃覆盖层作为独立 canvas image 叠在上方，由 Tk 原生做 alpha 混合。"""
+        if not self._video_player or not self._corner_mask:
+            return
+        frame = self._video_player.get_frame()
+        if frame is not None:
+            frame.putalpha(self._corner_mask)  # 直接替换 alpha 通道
+            if self._bg_photo is None:
+                self._bg_photo = ImageTk.PhotoImage(frame)
+                self.bg_canvas.create_image(
+                    0, 0, anchor="nw", image=self._bg_photo, tags="bg_video")
+                # 玻璃覆盖层叠在视频之上（仅创建一次）
+                self._glass_photo = ImageTk.PhotoImage(self._glass_overlay)
+                self.bg_canvas.create_image(
+                    0, 0, anchor="nw", image=self._glass_photo, tags="bg_overlay")
+                self.bg_canvas.tag_lower("bg_video")
+                self.bg_canvas.tag_lower("bg_overlay")
+            else:
+                self._bg_photo.paste(frame)
+        self._video_after = self.after(20, self._update_video_frame)
 
     def _set_text(self, tag, x, y, text, **kw):
         """在 canvas 上放置/更新一个文字项（透明背景）。"""
@@ -728,6 +892,10 @@ class App(tk.Tk):
             fill = (255, 255, 255, 60)
             tcolor = self.TEXT_DARK
             outline = (255, 255, 255, 160)
+        elif kind == "ghost_blue":
+            fill = (10, 132, 255, 90)
+            tcolor = "#ffffff"
+            outline = (10, 132, 255, 200)
         else:  # glass：浅色玻璃按钮
             fill = (255, 255, 255, 150)
             tcolor = self.TEXT_DARK
@@ -750,6 +918,61 @@ class App(tk.Tk):
                 self.bg_canvas.tag_bind(i, "<Leave>",
                                         lambda _e: self.bg_canvas.configure(cursor=""))
 
+    def _draw_ghost_field(self, tag, x, y, w, h, textvar, widget, is_combo=False):
+        """视频模式：用 ghost 样式 canvas 替代 ttk 控件，点击时弹出真实控件编辑。"""
+        self.bg_canvas.delete(tag)
+        # ghost 半透明背景 + 白色边框（同"打开皮肤文件夹"按钮风格）
+        im = self._rounded_img(w, h, min(h // 2, 12),
+                               (255, 255, 255, 60), (255, 255, 255, 160))
+        photo = ImageTk.PhotoImage(im)
+        self._btn_imgs[tag + "_g"] = photo
+        bg_id = self.bg_canvas.create_image(
+            x, y, anchor="nw", image=photo, tags=(tag, "ctrl"))
+        # 文字
+        tid = self.bg_canvas.create_text(
+            x + 12, y + h // 2, text=textvar.get(), anchor="w",
+            tags=(tag, "ctrl"), font=("Microsoft YaHei UI", 10),
+            fill=self.TEXT_DARK)
+        items = [bg_id, tid]
+        if is_combo:
+            aid = self.bg_canvas.create_text(
+                x + w - 14, y + h // 2, text="\u25be", tags=(tag, "ctrl"),
+                font=("Microsoft YaHei UI", 10), fill=self.TEXT_GREY)
+            items.append(aid)
+
+        def on_click(_e):
+            widget.place(x=x, y=y, width=w, height=h)
+            widget.focus_set()
+            if is_combo:
+                widget.event_generate("<Button-1>")
+            for it in items:
+                self.bg_canvas.itemconfigure(it, state="hidden")
+
+        def on_done(_e=None):
+            try:
+                widget.place_forget()
+            except Exception:
+                pass
+            try:
+                self.bg_canvas.itemconfig(tid, text=textvar.get())
+            except Exception:
+                pass
+            for it in items:
+                try:
+                    self.bg_canvas.itemconfigure(it, state="normal")
+                except Exception:
+                    pass
+
+        for it in items:
+            self.bg_canvas.tag_bind(it, "<Button-1>", on_click)
+            self.bg_canvas.tag_bind(it, "<Enter>",
+                                    lambda _e: self.bg_canvas.configure(cursor="xterm"))
+            self.bg_canvas.tag_bind(it, "<Leave>",
+                                    lambda _e: self.bg_canvas.configure(cursor=""))
+        if is_combo:
+            widget.bind("<<ComboboxSelected>>", on_done)
+        widget.bind("<FocusOut>", on_done)
+
     def _draw_segmented(self, tag, x, y, w, h, options, variable, command=None):
         """iOS 分段控件。options: [(显示文字, 值), ...]，画在主画布上。"""
         self.bg_canvas.delete(tag)
@@ -768,9 +991,15 @@ class App(tk.Tk):
         pad = 3 * scale
         sx0 = idx * sw * scale + pad
         sx1 = (idx + 1) * sw * scale - pad
-        d.rounded_rectangle([sx0, pad, sx1, h * scale - pad - 1],
-                            radius=(h - 3) * scale // 2,
-                            fill=(255, 255, 255, 255))
+        if self._video_mode:
+            d.rounded_rectangle([sx0, pad, sx1, h * scale - pad - 1],
+                                radius=(h - 3) * scale // 2,
+                                fill=(255, 255, 255, 60),
+                                outline=(255, 255, 255, 160), width=scale)
+        else:
+            d.rounded_rectangle([sx0, pad, sx1, h * scale - pad - 1],
+                                radius=(h - 3) * scale // 2,
+                                fill=(255, 255, 255, 255))
         photo = ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
         self._btn_imgs[tag] = photo
         iid = self.bg_canvas.create_image(x, y, anchor="nw", image=photo,
@@ -951,6 +1180,7 @@ class App(tk.Tk):
             pass
 
     def _win_close(self):
+        self._stop_video_bg()
         self.destroy()
 
     def _place_left(self, x, y, w, h):
@@ -993,7 +1223,12 @@ class App(tk.Tk):
         # URL 行（输入框占满）
         uy = y + 84
         url_w = max(120, w - 2 * pad)
-        self.url_entry.place(x=x + pad, y=uy, width=url_w, height=38)
+        if self._video_mode:
+            self.url_entry.place_forget()
+            self._draw_ghost_field("g_url", x + pad, uy, url_w, 38,
+                                   self.url_var, self.url_entry)
+        else:
+            self.url_entry.place(x=x + pad, y=uy, width=url_w, height=38)
 
         # 下载模式 —— iOS 分段控件
         my = uy + 62
@@ -1009,10 +1244,20 @@ class App(tk.Tk):
         qy = my + 56
         self._set_text("c_q", x + pad, qy + 15, "画质上限",
                        font=("Microsoft YaHei UI", 9), fill=self.TEXT_GREY)
-        self.quality_combo.place(x=x + pad + 80, y=qy, width=130, height=34)
+        if self._video_mode:
+            self.quality_combo.place_forget()
+            self._draw_ghost_field("g_qual", x + pad + 80, qy, 130, 34,
+                                   self.quality_var, self.quality_combo, is_combo=True)
+        else:
+            self.quality_combo.place(x=x + pad + 80, y=qy, width=130, height=34)
         self._set_text("c_a", x + pad + 228, qy + 15, "音频格式",
                        font=("Microsoft YaHei UI", 9), fill=self.TEXT_GREY)
-        self.audio_combo.place(x=x + pad + 302, y=qy, width=120, height=34)
+        if self._video_mode:
+            self.audio_combo.place_forget()
+            self._draw_ghost_field("g_audio", x + pad + 302, qy, 120, 34,
+                                   self.audio_var, self.audio_combo, is_combo=True)
+        else:
+            self.audio_combo.place(x=x + pad + 302, y=qy, width=120, height=34)
 
         # 只下载当前视频（独立一行，iOS 粉色勾选）
         cy = qy + 48
@@ -1029,28 +1274,48 @@ class App(tk.Tk):
         if avail - need - 16 >= 150:
             # 一行：输入框 + 浏览 + 打开目录
             dir_w = avail - need - 16
-            self.dir_entry.place(x=ex, y=dy, width=dir_w, height=34)
+            if self._video_mode:
+                self.dir_entry.place_forget()
+                self._draw_ghost_field("g_dir", ex, dy, dir_w, 34,
+                                       self.dir_var, self.dir_entry)
+            else:
+                self.dir_entry.place(x=ex, y=dy, width=dir_w, height=34)
             self._draw_button("b_browse", ex + dir_w + 8, dy - 1,
-                              72, 36, "浏览…", "gray", self._choose_dir)
+                              72, 36, "浏览…",
+                              "ghost" if self._video_mode else "gray",
+                              self._choose_dir)
             self._draw_button("b_open_dir", ex + dir_w + 88, dy - 1,
-                              88, 36, "打开目录", "gray", self._open_dir)
+                              88, 36, "打开目录",
+                              "ghost" if self._video_mode else "gray",
+                              self._open_dir)
             by2 = dy + 56
         else:
             # 两行：输入框占满，按钮右对齐到下一行
-            self.dir_entry.place(x=ex, y=dy, width=avail, height=34)
+            if self._video_mode:
+                self.dir_entry.place_forget()
+                self._draw_ghost_field("g_dir", ex, dy, avail, 34,
+                                       self.dir_var, self.dir_entry)
+            else:
+                self.dir_entry.place(x=ex, y=dy, width=avail, height=34)
             row2 = dy + 44
             self._draw_button("b_browse", x + w - pad - 160, row2 - 1,
-                              72, 36, "浏览…", "gray", self._choose_dir)
+                              72, 36, "浏览…",
+                              "ghost" if self._video_mode else "gray",
+                              self._choose_dir)
             self._draw_button("b_open_dir", x + w - pad - 88, row2 - 1,
-                              88, 36, "打开目录", "gray", self._open_dir)
+                              88, 36, "打开目录",
+                              "ghost" if self._video_mode else "gray",
+                              self._open_dir)
             by2 = row2 + 48
 
         # 操作按钮 + ffmpeg 状态
         running = bool(self.job and self.job.is_alive())
         self._draw_button("b_start", x + pad, by2, 120, 40, "开始下载",
-                          "blue", self._start, enabled=not running)
+                          "ghost_blue" if self._video_mode else "blue",
+                          self._start, enabled=not running)
         self._draw_button("b_cancel", x + pad + 136, by2, 90, 40, "取消",
-                          "gray", self._cancel, enabled=running)
+                          "ghost" if self._video_mode else "gray",
+                          self._cancel, enabled=running)
         ff = "ffmpeg 已就绪" if self.ffmpeg_dir else "ffmpeg 缺失（合并/转码不可用）"
         self._set_text("c_ff", x + pad + 244, by2 + 20, ff, anchor="w",
                        fill="#1d9e52" if self.ffmpeg_dir else "#c77700",
@@ -1200,13 +1465,19 @@ class App(tk.Tk):
 
     # ---- 皮肤 / 面板 ----
     def _choose_skin(self):
-        path = self._ask_image("选择背景皮肤图片")
+        path = filedialog.askopenfilename(
+            title="选择背景皮肤（图片或视频）",
+            filetypes=[("图片和视频", "*.jpg *.jpeg *.png *.webp *.bmp "
+                                 "*.mp4 *.webm *.mkv *.mov *.avi *.gif"),
+                       ("图片文件", "*.jpg *.jpeg *.png *.webp *.bmp"),
+                       ("视频文件", "*.mp4 *.webm *.mkv *.mov *.avi *.gif"),
+                       ("所有文件", "*.*")])
         if not path:
             return
         try:
             import_skin(path)
         except Exception as e:
-            messagebox.showerror("更换皮肤失败", f"无法使用该图片：\n{e}")
+            messagebox.showerror("更换皮肤失败", f"无法使用该文件：\n{e}")
             return
         self._layout()
 
