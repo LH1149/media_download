@@ -6,7 +6,7 @@
 
 **动态背景（视频皮肤）模式** — 控件采用半透明 ghost 样式，不遮挡动态背景：
 
-<video src="docs/video.mp4" controls muted loop width="100%" poster="docs/pic.png"></video>
+![动态背景效果](docs/video.gif)
 
 **静态背景（图片皮肤）模式**：
 
